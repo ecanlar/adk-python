@@ -21,6 +21,7 @@ from typing import Optional
 from unittest import mock
 from unittest.mock import AsyncMock
 
+from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.invocation_context import LlmCallsLimitExceededError
 from google.adk.agents.llm_agent import Agent
@@ -42,10 +43,12 @@ from google.adk.flows.llm_flows.base_llm_flow import _process_agent_tools
 from google.adk.flows.llm_flows.base_llm_flow import _ReconnectSentinel
 from google.adk.flows.llm_flows.base_llm_flow import BaseLlmFlow
 from google.adk.live import LiveRequestQueue
+from google.adk.models.base_llm import BaseLlm
 from google.adk.models.base_llm_connection import BaseLlmConnection
 from google.adk.models.google_llm import Gemini
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
+from google.adk.models.registry import LLMRegistry
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.tools.base_toolset import BaseToolset
@@ -3535,3 +3538,42 @@ async def test_eof_connection_ends_the_run_instead_of_spinning():
       await asyncio.wait_for(drive(), timeout=5)
 
   assert receive_calls == 1
+
+
+class _SyncOnlyAgent(BaseAgent):
+  """An agent supplying the LlmAgent model surface without subclassing it.
+
+  `_invocation_utils.as_llm_agent` documents that flows drive agents shaped
+  like this, so resolving a model must not require the async accessors.
+  """
+
+  @property
+  def canonical_model(self) -> BaseLlm:
+    return LLMRegistry.new_llm('gemini-2.5-flash')
+
+  @property
+  def canonical_live_model(self) -> BaseLlm:
+    return LLMRegistry.new_llm('gemini-2.5-flash')
+
+
+@pytest.mark.asyncio
+async def test_get_llm_reads_an_agent_that_has_only_the_sync_properties():
+  agent = _SyncOnlyAgent(name='sync_only')
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+
+  llm = await BaseLlmFlow()._BaseLlmFlow__get_llm(invocation_context)
+
+  assert llm.model == 'gemini-2.5-flash'
+
+
+@pytest.mark.asyncio
+async def test_get_llm_rejects_an_agent_with_no_model_at_all():
+  agent = BaseAgent(name='no_model')
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+
+  with pytest.raises(TypeError, match='canonical_model'):
+    await BaseLlmFlow()._BaseLlmFlow__get_llm(invocation_context)
