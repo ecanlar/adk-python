@@ -2627,7 +2627,7 @@ async def test_transfer_to_sibling_disallowed_raises_value_error():
 
   # Act & Assert
   with pytest.raises(
-      ValueError, match='Transfer to sibling agent child2 is disallowed'
+      ValueError, match='child1 is not allowed to transfer to agent child2'
   ):
     flow._get_agent_to_run(ctx, 'child2')
 
@@ -2703,6 +2703,56 @@ async def test_transfer_to_sibling_from_non_llm_agent_allowed():
   # Assert
   assert agent is not None
   assert agent.name == 'child2'
+
+
+@pytest.mark.asyncio
+async def test_transfer_to_unoffered_agent_raises_value_error():
+  """Transfer to an agent that is only reachable through the tree is rejected."""
+  # Arrange
+  _, child1, child2 = _make_agent_tree()
+  grandchild2 = Agent(name='grandchild2')
+  grandchild2.parent_agent = child2
+  child2.sub_agents = [grandchild2]
+  ctx = await testing_utils.create_invocation_context(child1)
+  flow = BaseLlmFlow()
+
+  # Act & Assert
+  with pytest.raises(
+      ValueError, match='child1 is not allowed to transfer to agent grandchild2'
+  ):
+    flow._get_agent_to_run(ctx, 'grandchild2')
+
+
+@pytest.mark.asyncio
+async def test_transfer_to_parent_disallowed_raises_value_error():
+  """Transfer to parent raises ValueError when disallow_transfer_to_parent is True."""
+  # Arrange
+  _, child1, _ = _make_agent_tree()
+  child1.disallow_transfer_to_parent = True
+  ctx = await testing_utils.create_invocation_context(child1)
+  flow = BaseLlmFlow()
+
+  # Act & Assert
+  with pytest.raises(
+      ValueError, match='child1 is not allowed to transfer to agent root'
+  ):
+    flow._get_agent_to_run(ctx, 'root')
+
+
+@pytest.mark.asyncio
+async def test_transfer_to_parent_allowed_returns_agent():
+  """Transfer to parent returns the agent when it is not disallowed."""
+  # Arrange
+  _, child1, _ = _make_agent_tree()
+  ctx = await testing_utils.create_invocation_context(child1)
+  flow = BaseLlmFlow()
+
+  # Act
+  agent = flow._get_agent_to_run(ctx, 'root')
+
+  # Assert
+  assert agent is not None
+  assert agent.name == 'root'
 
 
 @pytest.mark.asyncio
