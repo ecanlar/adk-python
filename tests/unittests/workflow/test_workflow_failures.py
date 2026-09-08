@@ -15,6 +15,7 @@
 """Tests for Workflow error handling, graceful shutdown, and retry logic."""
 
 import asyncio
+import logging
 from typing import Any
 from typing import AsyncGenerator
 from unittest import mock
@@ -32,6 +33,7 @@ from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.workflow import BaseNode
 from google.adk.workflow import Edge
 from google.adk.workflow import START
+from google.adk.workflow._errors import NodeTimeoutError
 from google.adk.workflow._graph import Graph
 from google.adk.workflow._node import Node
 from google.adk.workflow._node import node
@@ -1079,6 +1081,225 @@ async def test_workflow_returns_normally_on_node_failure():
       and e.node_info.path == 'test_error_workflow@1'
   ]
   assert len(workflow_error_events) == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_config_on_nested_workflow_retries_failing_child():
+  """A sub-workflow's retry_config re-runs a child node that raises.
+
+  A Workflow reports a failing child by setting an error on its context
+  instead of raising, so this only works if the node runner treats a
+  reported failure the same as a raised one.
+  """
+  attempts = 0
+  downstream_input = None
+
+  @node()
+  def flaky_node(ctx: Context):
+    nonlocal attempts
+    attempts += 1
+    if attempts < 3:
+      raise CustomError('Node failed')
+    yield 'recovered'
+
+  @node()
+  def downstream_node(ctx: Context, node_input: Any):
+    nonlocal downstream_input
+    downstream_input = node_input
+    yield 'downstream'
+
+  inner_wf = Workflow(
+      name='inner_wf',
+      edges=[(START, flaky_node)],
+      retry_config=RetryConfig(max_attempts=3, initial_delay=0.0, jitter=0.0),
+  )
+  outer_wf = Workflow(
+      name='outer_wf',
+      edges=[(START, inner_wf, downstream_node)],
+  )
+
+  await _run_workflow(outer_wf)
+
+  assert attempts == 3
+  assert downstream_input == 'recovered'
+
+
+@pytest.mark.asyncio
+async def test_retry_config_on_nested_workflow_gives_up_after_max_attempts():
+  """A child that keeps failing still fails the workflow once retries run out.
+
+  The failure must keep propagating: it must not be replayed as a completed
+  node and fast-forwarded into a false success.
+  """
+  attempts = 0
+  downstream_ran = False
+
+  @node()
+  def failing_node(ctx: Context):
+    nonlocal attempts
+    attempts += 1
+    raise CustomError('Node failed')
+    yield 'output'
+
+  @node()
+  def downstream_node(ctx: Context):
+    nonlocal downstream_ran
+    downstream_ran = True
+    yield 'downstream'
+
+  inner_wf = Workflow(
+      name='inner_wf',
+      edges=[(START, failing_node)],
+      retry_config=RetryConfig(max_attempts=3, initial_delay=0.0, jitter=0.0),
+  )
+  outer_wf = Workflow(
+      name='outer_wf',
+      edges=[(START, inner_wf, downstream_node)],
+  )
+
+  events, _, _ = await _run_workflow(outer_wf)
+
+  assert attempts == 3
+  assert not downstream_ran
+  error_events = [
+      e
+      for e in events
+      if isinstance(e, Event) and e.error_code == 'CustomError'
+  ]
+  assert error_events
+
+
+@pytest.mark.asyncio
+async def test_retry_config_on_nested_workflow_replays_completed_children():
+  """A retried sub-workflow does not redo a child that already produced output."""
+  completed_attempts = 0
+  flaky_attempts = 0
+
+  @node()
+  def completed_node(ctx: Context):
+    nonlocal completed_attempts
+    completed_attempts += 1
+    yield 'done'
+
+  @node()
+  def flaky_node(ctx: Context, node_input: Any):
+    nonlocal flaky_attempts
+    flaky_attempts += 1
+    if flaky_attempts < 3:
+      raise CustomError('Node failed')
+    yield 'recovered'
+
+  inner_wf = Workflow(
+      name='inner_wf',
+      edges=[(START, completed_node, flaky_node)],
+      retry_config=RetryConfig(max_attempts=3, initial_delay=0.0, jitter=0.0),
+  )
+  outer_wf = Workflow(name='outer_wf', edges=[(START, inner_wf)])
+
+  await _run_workflow(outer_wf)
+
+  assert flaky_attempts == 3
+  assert completed_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_config_on_outer_workflow_retries_nested_failure():
+  """A failure inside a sub-workflow is a failure of the outer workflow too."""
+  attempts = 0
+
+  @node()
+  def flaky_node(ctx: Context):
+    nonlocal attempts
+    attempts += 1
+    if attempts < 3:
+      raise CustomError('Node failed')
+    yield 'recovered'
+
+  inner_wf = Workflow(name='inner_wf', edges=[(START, flaky_node)])
+  outer_wf = Workflow(
+      name='outer_wf',
+      edges=[(START, inner_wf)],
+      retry_config=RetryConfig(max_attempts=3, initial_delay=0.0, jitter=0.0),
+  )
+
+  await _run_workflow(outer_wf)
+
+  assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_retry_config_on_nested_workflow_honors_exceptions_filter():
+  """The exceptions filter matches the child's error, not the workflow."""
+  retryable_attempts = 0
+  non_retryable_attempts = 0
+
+  @node()
+  def retryable_node(ctx: Context):
+    nonlocal retryable_attempts
+    retryable_attempts += 1
+    raise CustomRetryableError('Node failed')
+    yield 'output'
+
+  @node()
+  def non_retryable_node(ctx: Context):
+    nonlocal non_retryable_attempts
+    non_retryable_attempts += 1
+    raise CustomNonRetryableError('Node failed')
+    yield 'output'
+
+  retry_config = RetryConfig(
+      max_attempts=3,
+      initial_delay=0.0,
+      jitter=0.0,
+      exceptions=[CustomRetryableError],
+  )
+
+  retryable_wf = Workflow(
+      name='retryable_wf',
+      edges=[(START, retryable_node)],
+      retry_config=retry_config,
+  )
+  with pytest.raises(CustomRetryableError):
+    await _run_workflow(Workflow(name='outer', edges=[(START, retryable_wf)]))
+
+  non_retryable_wf = Workflow(
+      name='non_retryable_wf',
+      edges=[(START, non_retryable_node)],
+      retry_config=retry_config,
+  )
+  with pytest.raises(CustomNonRetryableError):
+    await _run_workflow(
+        Workflow(name='outer2', edges=[(START, non_retryable_wf)])
+    )
+
+  assert retryable_attempts == 3
+  assert non_retryable_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_config_on_nested_workflow_retries_its_own_timeout():
+  """A sub-workflow's retry_config also applies when it times out as a unit."""
+  attempts = 0
+
+  @node()
+  async def slow_node():
+    nonlocal attempts
+    attempts += 1
+    await asyncio.sleep(1.0)
+    return 'done'
+
+  inner_wf = Workflow(
+      name='inner_wf',
+      edges=[(START, slow_node)],
+      timeout=0.05,
+      retry_config=RetryConfig(max_attempts=3, initial_delay=0.0, jitter=0.0),
+  )
+  outer_wf = Workflow(name='outer_wf', edges=[(START, inner_wf)])
+
+  with pytest.raises(NodeTimeoutError):
+    await _run_workflow(outer_wf)
+
+  assert attempts == 3
 
 
 @pytest.mark.asyncio
