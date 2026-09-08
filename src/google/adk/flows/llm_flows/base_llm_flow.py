@@ -807,18 +807,17 @@ class BaseLlmFlow(ABC):
       A generator of events.
     """
 
-    # Runs processors.
-    async with Aclosing(
-        self._postprocess_run_processors_async(invocation_context, llm_response)
-    ) as agen:
-      async for event in agen:
-        yield event
-
     # A non-streaming turn that finishes with STOP but has no content parts would
     # otherwise be skipped below and become a silent empty final response;
     # surface it as an actionable error instead. Streaming is excluded
     # because a terminal finish-only chunk legitimately follows content already
     # streamed in earlier chunks.
+    #
+    # This must run before the response processors. Emptiness is a property of
+    # what the model returned, so it can only be judged before local processing
+    # touches the response: a processor may clear the content deliberately to
+    # signal that the flow should continue, as the code execution processor does
+    # once it has run the code and emitted its result.
     run_config = _require_run_config(invocation_context)
     if (
         not llm_response.partial
@@ -831,6 +830,13 @@ class BaseLlmFlow(ABC):
       llm_response.error_message = (
           llm_response.error_message or _NO_CONTENT_ERROR_MESSAGE
       )
+
+    # Runs processors.
+    async with Aclosing(
+        self._postprocess_run_processors_async(invocation_context, llm_response)
+    ) as agen:
+      async for event in agen:
+        yield event
 
     # Skip the model response event if there is no content and no error code.
     # This is needed for the code executor to trigger another loop.

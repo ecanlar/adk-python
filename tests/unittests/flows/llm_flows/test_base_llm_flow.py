@@ -28,6 +28,9 @@ from google.adk.agents.loop_agent import LoopAgent
 from google.adk.agents.run_config import RunConfig
 from google.adk.agents.run_config import StreamingMode
 from google.adk.apps.app import ResumabilityConfig
+from google.adk.code_executors.base_code_executor import BaseCodeExecutor
+from google.adk.code_executors.code_execution_utils import CodeExecutionInput
+from google.adk.code_executors.code_execution_utils import CodeExecutionResult
 from google.adk.events.event import Event
 from google.adk.features import FeatureName
 from google.adk.features._feature_registry import temporary_feature_override
@@ -2507,6 +2510,57 @@ def _make_agent_tree():
   child2.parent_agent = root
   root.sub_agents = [child1, child2]
   return root, child1, child2
+
+
+class _StubCodeExecutor(BaseCodeExecutor):
+  """Returns a fixed result and counts how many times it ran."""
+
+  executed: list[str] = []
+
+  def execute_code(
+      self,
+      invocation_context,
+      code_execution_input: CodeExecutionInput,
+  ) -> CodeExecutionResult:
+    self.executed.append(code_execution_input.code)
+    return CodeExecutionResult(stdout='42\n')
+
+
+@pytest.mark.asyncio
+async def test_code_execution_stop_response_continues_the_loop():
+  """Regression test for a code block returned with finish_reason=STOP.
+
+  The code execution response processor clears the response content once it has
+  run the code, which is how it tells the flow to ask the model again. That
+  cleared content must not be mistaken for a model that returned nothing, so
+  the flow has to make a second model call and emit the final answer.
+  """
+  code_turn = LlmResponse(
+      content=types.Content(
+          role='model',
+          parts=[types.Part(text='```python\nprint(6 * 7)\n```')],
+      ),
+      finish_reason=types.FinishReason.STOP,
+  )
+  final_turn = LlmResponse(
+      content=types.Content(
+          role='model', parts=[types.Part(text='The answer is 42.')]
+      ),
+      finish_reason=types.FinishReason.STOP,
+  )
+
+  code_executor = _StubCodeExecutor()
+  mock_model = testing_utils.MockModel.create(responses=[code_turn, final_turn])
+  agent = Agent(
+      name='root_agent', model=mock_model, code_executor=code_executor
+  )
+  events = testing_utils.InMemoryRunner(agent).run('What is 6 * 7?')
+
+  assert code_executor.executed == ['print(6 * 7)']
+  assert len(mock_model.requests) == 2
+  assert not [e for e in events if e.error_code]
+  assert events[-1].content
+  assert events[-1].content.parts[0].text == 'The answer is 42.'
 
 
 @pytest.mark.asyncio
