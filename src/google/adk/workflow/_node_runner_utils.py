@@ -175,6 +175,15 @@ async def run_node_async(
             )
             if yield_user_message and user_event:
               yield user_event
+          elif state_delta:
+            # Resuming without a new message: there is no user message event to
+            # carry the delta, so append it as a content-less event instead of
+            # dropping it.
+            delta_event = await runner._append_state_delta_event(  # pylint: disable=protected-access
+                ic, state_delta
+            )
+            if yield_user_message and delta_event:
+              yield delta_event
 
           # Run before_run callbacks. A returned Content halts execution and ends
           # the run with that content (same contract as the non-workflow path).
