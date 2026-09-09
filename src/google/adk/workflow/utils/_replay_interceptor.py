@@ -80,9 +80,14 @@ def check_interception(
             interrupts=set(current_run.state.interrupts),
         )
 
-  # Intercept executions based on historical session events (cross-turn replay).
   if not recovered:
     return InterceptionResult(should_run=True)
+
+  if isinstance(node, Workflow):
+    return InterceptionResult(
+        should_run=True,
+        resume_inputs=recovered.resolved_responses,
+    )
 
   unresolved = recovered.interrupt_ids - recovered.resolved_ids
 

@@ -204,7 +204,7 @@ async def run_node_async(
             has_sub_agents = is_agent and bool(
                 getattr(runner.agent, "sub_agents", None)
             )
-            use_scheduler = is_agent and has_sub_agents
+            use_scheduler = not is_agent or has_sub_agents
 
             # The root chat coordinator's isolation_scope stays None: its own
             # events (FCs, text, synthesized FRs from completed task
@@ -236,6 +236,7 @@ async def run_node_async(
                 except DynamicNodeFailError as e:
                   raise e.error
               finally:
+                root_ctx._workflow_scheduler = None  # pylint: disable=protected-access
                 assert ic._event_queue is not None  # pylint: disable=protected-access
                 await ic._event_queue.put((done_sentinel, None))  # pylint: disable=protected-access
 
